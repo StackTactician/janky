@@ -1,0 +1,196 @@
+name: CI & Verification Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # --------------------------------------------------------------------------
+  # 1. Multi-Architecture Matrix Build & Compilation Check
+  # --------------------------------------------------------------------------
+  build-and-test:
+    name: Build & Test (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Target 1: Termux / Android aarch64 (User target architecture)
+          - target: aarch64-linux-android
+            use_ndk: true
+            run_native_tests: false
+            artifact_name: janky-aarch64-linux-android
+            description: "Termux / Android 64-bit ARM"
+
+          # Target 2: Standard 64-bit Linux (Host runner native architecture)
+          - target: x86_64-unknown-linux-gnu
+            use_ndk: false
+            run_native_tests: true
+            artifact_name: janky-x86_64-unknown-linux-gnu
+            description: "Standard Linux 64-bit x86"
+
+          # Target 3: WebAssembly (Edge / Browser / Serverless)
+          - target: wasm32-unknown-unknown
+            use_ndk: false
+            run_native_tests: false
+            artifact_name: janky-wasm32-unknown-unknown
+            description: "WebAssembly Core"
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy, rustfmt
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Setup Android NDK toolchain for aarch64-linux-android cross-compilation
+      - name: Set up Android NDK (r26d)
+        if: matrix.use_ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+          add-to-path: true
+
+      - name: Configure Android NDK Cross-Linker
+        if: matrix.use_ndk
+        run: |
+          NDK_LLVM_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$NDK_LLVM_BIN/aarch64-linux-android24-clang" >> $GITHUB_ENV
+          echo "CC_aarch64_linux_android=$NDK_LLVM_BIN/aarch64-linux-android24-clang" >> $GITHUB_ENV
+          echo "CXX_aarch64_linux_android=$NDK_LLVM_BIN/aarch64-linux-android24-clang++" >> $GITHUB_ENV
+          echo "AR_aarch64_linux_android=$NDK_LLVM_BIN/llvm-ar" >> $GITHUB_ENV
+          echo "Configured aarch64-linux-android24-clang cross linker."
+
+      # Code formatting check (enforced on native host)
+      - name: Check Formatting (rustfmt)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          if [ -f Cargo.toml ]; then
+            cargo fmt --all --check
+          else
+            echo "Notice: Cargo.toml not found; skipping rustfmt."
+          fi
+
+      # Mandatory Step 1: cargo check --no-default-features
+      - name: Cargo Check (--no-default-features)
+        run: |
+          if [ -f Cargo.toml ]; then
+            cargo check --target ${{ matrix.target }} --no-default-features --verbose
+          else
+            echo "Notice: Cargo.toml not yet present in repository root. Step completed."
+          fi
+
+      # Mandatory Step 2: cargo clippy
+      - name: Cargo Clippy Lint
+        run: |
+          if [ -f Cargo.toml ]; then
+            cargo clippy --target ${{ matrix.target }} --all-targets -- -D warnings
+          else
+            echo "Notice: Cargo.toml not yet present in repository root. Step completed."
+          fi
+
+      # Mandatory Step 3: cargo test
+      - name: Cargo Test
+        run: |
+          if [ -f Cargo.toml ]; then
+            if [ "${{ matrix.run_native_tests }}" = "true" ]; then
+              echo "Executing native tests on ${{ matrix.target }}..."
+              cargo test --target ${{ matrix.target }} --verbose
+            else
+              echo "Compiling and linking tests for cross target ${{ matrix.target }} (--no-run)..."
+              cargo test --target ${{ matrix.target }} --no-run --verbose
+            fi
+          else
+            echo "Notice: Cargo.toml not yet present in repository root. Step completed."
+          fi
+
+      # Build Release Binaries
+      - name: Build Release Binaries
+        run: |
+          mkdir -p dist/${{ matrix.artifact_name }}
+          if [ -f Cargo.toml ]; then
+            cargo build --target ${{ matrix.target }} --release
+            # Copy all produced binaries / libraries to dist directory
+            find target/${{ matrix.target }}/release/ -maxdepth 1 -type f -executable -exec cp {} dist/${{ matrix.artifact_name }}/ \; 2>/dev/null || true
+            find target/${{ matrix.target }}/release/ -maxdepth 1 -name "*.so" -exec cp {} dist/${{ matrix.artifact_name }}/ \; 2>/dev/null || true
+            find target/${{ matrix.target }}/release/ -maxdepth 1 -name "*.wasm" -exec cp {} dist/${{ matrix.artifact_name }}/ \; 2>/dev/null || true
+          fi
+          # Ensure artifact directory is populated with manifest info
+          echo "Target Architecture: ${{ matrix.target }}" > dist/${{ matrix.artifact_name }}/BUILD_INFO.txt
+          echo "Commit: ${{ github.sha }}" >> dist/${{ matrix.artifact_name }}/BUILD_INFO.txt
+          echo "Built At: $(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> dist/${{ matrix.artifact_name }}/BUILD_INFO.txt
+
+      # Mandatory Step 4: Upload workflow artifacts (actions/upload-artifact@v4)
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}/
+          retention-days: 14
+          if-no-files-found: warn
+
+  # --------------------------------------------------------------------------
+  # 2. Dynamic Memory Safety Verification (Miri with Tree Borrows)
+  # --------------------------------------------------------------------------
+  miri-safety-verification:
+    name: Miri Undefined Behavior & Tree Borrows Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Nightly Rust with Miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: miri-tree-borrows
+
+      - name: Setup Miri Sysroot
+        run: |
+          if [ -f Cargo.toml ]; then
+            cargo miri setup
+          fi
+
+      - name: Execute Miri Verification on Core Safety Crate
+        env:
+          # Strict formal memory model flags specified in JANKY-SPEC-02 Section 7.2
+          MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-check-number-validity -Zmiri-strict-provenance"
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "Starting formal Miri verification with Tree Borrows and Strict Provenance..."
+            # Check for janky-core package specifically, or run on root workspace
+            if cargo metadata --format-version 1 | grep -q '"name":"janky-core"'; then
+              echo "Targeting core safety crate: janky-core"
+              cargo miri test -p janky-core --verbose
+            elif cargo metadata --format-version 1 | grep -q '"name":"janky"'; then
+              echo "Targeting package: janky"
+              cargo miri test -p janky --verbose
+            else
+              echo "Running Miri across all crates in workspace..."
+              cargo miri test --verbose
+            fi
+          else
+            echo "Notice: Cargo.toml not yet present in repository root. Miri step armed."
+          fi
