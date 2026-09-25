@@ -672,6 +672,8 @@ The following complete, standalone, `#![no_std]` module incorporates all adversa
 //! JANKY Hardened Safety & Memory Kernel (Red Team Remediated Reference)
 #![no_std]
 
+use core::convert::{TryFrom, TryInto};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerificationError {
     BufferTooShort,
